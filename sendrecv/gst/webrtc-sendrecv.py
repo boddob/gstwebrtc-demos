@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import argparse
+import time
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -16,9 +17,12 @@ gi.require_version('GstSdp', '1.0')
 from gi.repository import GstSdp
 
 PIPELINE_DESC = '''
-webrtcbin name=sendrecv bundle-policy=max-bundle
- videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay !
- queue ! application/x-rtp,media=video,encoding-name=VP8,payload=97 ! sendrecv.
+webrtcbin name=sendrecv bundle-policy=max-bundle stun-server=stun://stun.l.google.com:19302
+ videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! x264enc tune=zerolatency key-int-max=20 ! video/x-h264, profile=constrained-baseline ! h264parse ! rtph264pay !
+ queue ! application/x-rtp,media=video,encoding-name=H264,payload=97 ! sendrecv.
+'''
+
+BLEH='''
  audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay !
  queue ! application/x-rtp,media=audio,encoding-name=OPUS,payload=96 ! sendrecv.
 '''
@@ -34,8 +38,11 @@ class WebRTCClient:
 
     async def connect(self):
         sslctx = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
-        self.conn = await websockets.connect(self.server, ssl=sslctx)
-        await self.conn.send('HELLO %d' % our_id)
+        sslctx.options &= ~ssl.OP_NO_SSLv3
+        self.conn = await websockets.connect(self.server,ssl=sslctx)
+        print("got self.conn %s"%str(self.conn))
+        self.start_pipeline()
+        #await self.conn.send(json.dumps({'status' : True}))
 
     async def setup_call(self):
         await self.conn.send('SESSION {}'.format(self.peer_id))
@@ -43,9 +50,13 @@ class WebRTCClient:
     def send_sdp_offer(self, offer):
         text = offer.sdp.as_text()
         print ('Sending offer:\n%s' % text)
-        msg = json.dumps({'sdp': {'type': 'offer', 'sdp': text}})
+        sdp = {'type': 'offer', 'sdp': text}
+        streamInfo = { 'applicationName': 'webrtc', 'streamName':self.peer_id, 'sessionId':'[empty]' }
+        req = '{ "direction" : "publish","command" : "sendOffer","streamInfo" :' + json.dumps(streamInfo) + ', "sdp" :' + json.dumps(sdp) + ',"userData":{"param1":"value1"}' + '}'
+        #msg = json.dumps(req)
+        print(req)
         loop = asyncio.new_event_loop()
-        loop.run_until_complete(self.conn.send(msg))
+        loop.run_until_complete(self.conn.send(req))
 
     def on_offer_created(self, promise, _, __):
         promise.wait()
@@ -113,6 +124,15 @@ class WebRTCClient:
         self.webrtc.connect('pad-added', self.on_incoming_stream)
         self.pipe.set_state(Gst.State.PLAYING)
 
+    def handle_ice(self, message):
+        msg = json.loads(message)
+        iceCandidates = msg['iceCandidates']
+        print("got ice: %s"%str(iceCandidates))
+        for candidate in iceCandidates:
+            c = candidate["candidate"] #+ " tcptype passive"
+            line = candidate["sdpMLineIndex"]
+            self.webrtc.emit('add-ice-candidate', line, c)
+
     async def handle_sdp(self, message):
         assert (self.webrtc)
         msg = json.loads(message)
@@ -129,13 +149,24 @@ class WebRTCClient:
             promise.interrupt()
         elif 'ice' in msg:
             ice = msg['ice']
-            candidate = ice['candidate']
+            candidate = ice['candidate'] + " tcptype active"
             sdpmlineindex = ice['sdpMLineIndex']
             self.webrtc.emit('add-ice-candidate', sdpmlineindex, candidate)
 
     async def loop(self):
         assert self.conn
+        msg = await self.conn.recv()
+        print(msg)
+        self.handle_ice(msg)
+        #sleep here to simulate a gap between getting SDP and ICE info
+        time.sleep(3)
+        await self.handle_sdp(msg)
+
+'''
+        print(self.conn)
         async for message in self.conn:
+            print(message)
+            return 1
             if message == 'HELLO':
                 await self.setup_call()
             elif message == 'SESSION_OK':
@@ -146,6 +177,7 @@ class WebRTCClient:
             else:
                 await self.handle_sdp(message)
         return 0
+'''
 
 
 def check_plugins():
@@ -170,4 +202,7 @@ if __name__=='__main__':
     c = WebRTCClient(our_id, args.peerid, args.server)
     asyncio.get_event_loop().run_until_complete(c.connect())
     res = asyncio.get_event_loop().run_until_complete(c.loop())
+    while True:
+        time.sleep(1)
+    #Gst.debug_bin_to_dot_file(c.pipe, Gst.DebugGraphDetails(15), "temp")
     sys.exit(res)
